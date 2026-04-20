@@ -1,0 +1,175 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: bdsnowflake-postgres
+    environment:
+      POSTGRES_DB: bdsnowflake
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - "./docker/init:/docker-entrypoint-initdb.d:ro"
+      - "./исходные данные:/data:ro"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bdsnowflake"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+    healthcheck:
+      test: ["CMD", "cub", "zk-ready", "localhost:2181", "30"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  # Снимает «зависшую» регистрацию брокера в ZK (иначе Kafka падает с NodeExists при registerBroker).
+  kafka-zk-prune:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set +e
+        printf 'deleteall /brokers/ids\nquit\n' | zookeeper-shell zookeeper:2181
+        echo "kafka-zk-prune done (ignore errors if path was empty)"
+        exit 0
+    restart: "no"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      kafka-zk-prune:
+        condition: service_completed_successfully
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  # Топик должен существовать до старта Flink Kafka Source, иначе джоба падает (UnknownTopicOrPartition).
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - "kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic sales-raw --partitions 2 --replication-factor 1"
+    restart: "no"
+
+  jobmanager:
+    image: flink:1.18.1-java11
+    hostname: jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |-
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+
+  taskmanager:
+    image: flink:1.18.1-java11
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |-
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: sales-raw
+      KAFKA_GROUP_ID: flink-star-schema-pipeline
+      JDBC_URL: jdbc:postgresql://postgres:5432/bdsnowflake
+      JDBC_USER: postgres
+      JDBC_PASSWORD: postgres
+      FLINK_PARALLELISM: "1"
+
+  csv-producer:
+    build: ./csv-kafka-producer
+    pull_policy: build
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      DATA_DIR: /data
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: sales-raw
+      MESSAGE_DELAY_MS: "0"
+    volumes:
+      - "./исходные данные:/data:ro"
+    restart: "no"
+
+  flink-submit:
+    build:
+      context: ./flink-job
+      dockerfile: Dockerfile
+    image: bigdataflink-flink-submit:latest
+    pull_policy: build
+    depends_on:
+      jobmanager:
+        condition: service_started
+      taskmanager:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        echo "Waiting for Flink REST..."
+        for i in $$(seq 1 90); do
+          if wget -qO- http://jobmanager:8081/overview >/dev/null 2>&1; then
+            echo "JobManager ready."
+            break
+          fi
+          sleep 2
+        done
+        sleep 8
+        /opt/flink/bin/flink run -d -m jobmanager:8081 -c ru.visoko.flink.star.SalesStarKafkaJob /opt/job/flink-star-job.jar
+        echo "Submitted."
+    restart: "no"
+
+volumes:
+  pgdata:
+  zookeeper-data:
+  kafka-data:
